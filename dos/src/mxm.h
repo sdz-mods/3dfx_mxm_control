@@ -1,29 +1,22 @@
-#ifndef MXM_H
-#define MXM_H
+#ifndef DOS_MXM_H
+#define DOS_MXM_H
 
-#include <windows.h>
-
+#include "mxm_protocol.h"
 #include "pci.h"
-
-typedef enum {
-	MXM_CARD_NONE = 0,
-	MXM_CARD_M4800,
-	MXM_CARD_M3800,
-} mxm_card_type_t;
 
 typedef struct {
 	int present;
 	mxm_card_type_t type;
 	pci_bdf_t bridge;
-	WORD ssid;
-	char model[32];
+	u16 ssid;
+	char model[24];
 	char gpu[16];
 	char display[8];
 	char revision[8];
 } mxm_card_t;
 
 typedef struct {
-	BYTE raw[5];
+	u8 raw[5];
 	int brightness;
 	int vcore_deci;
 	int fb_mb;
@@ -35,9 +28,9 @@ typedef struct {
 
 int mxm_detect(mxm_card_t *card);
 int mxm_read_settings(const mxm_card_t *card, mxm_settings_t *settings);
-int mxm_write_settings(const mxm_card_t *card, const mxm_settings_t *settings);
+int mxm_write_settings(const mxm_card_t *card,
+		       const mxm_settings_t *settings);
 void mxm_defaults(const mxm_card_t *card, mxm_settings_t *settings);
-void mxm_card_clear(mxm_card_t *card);
 const char *mxm_last_error(void);
 
 #endif

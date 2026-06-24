@@ -5,6 +5,7 @@
 
 #include "io_backend.h"
 #include "hwc_ext.h"
+#include "mxm_protocol.h"
 #include "mxm.h"
 #include "resource.h"
 
@@ -41,7 +42,7 @@ static int g_io_ready;
 static mxm_card_t g_card;
 static mxm_settings_t g_settings;
 static hwc_ext_info_t g_hwc;
-static int g_clock_mhz = 166;
+static int g_clock_mhz = MXM_CLOCK_DEFAULT_MHZ;
 
 static HWND lbl_backend;
 static HWND lbl_card;
@@ -406,7 +407,7 @@ static void load_defaults(void)
 	memcpy(raw, g_settings.raw, sizeof(raw));
 
 	mxm_defaults(&g_card, &g_settings);
-	g_clock_mhz = 166;
+	g_clock_mhz = MXM_CLOCK_DEFAULT_MHZ;
 	g_settings.gpu_temp = gpu_temp;
 	g_settings.smc_temp = smc_temp;
 	g_settings.fan_speed = fan_speed;
@@ -458,7 +459,8 @@ static void create_ui(void)
 	lbl_clock = make_label("Core/Memory Clock:", 28, 426, 210, 18);
 	trk_clock = make_control(TRACKBAR_CLASSA, "", WS_TABSTOP | TBS_AUTOTICKS,
 				 250, 418, 260, 40, ID_CLOCK);
-	SendMessage(trk_clock, TBM_SETRANGE, TRUE, MAKELONG(150, 220));
+	SendMessage(trk_clock, TBM_SETRANGE, TRUE,
+		    MAKELONG(MXM_CLOCK_MIN_MHZ, MXM_CLOCK_MAX_MHZ));
 	SendMessage(trk_clock, TBM_SETTICFREQ, 10, 0);
 
 	make_hline(24, 464, 552);

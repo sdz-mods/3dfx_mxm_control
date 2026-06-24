@@ -2,6 +2,7 @@
 #include <string.h>
 
 #include "hwc_ext.h"
+#include "mxm_protocol.h"
 #include "pci.h"
 
 #define EXT_HWC_NEW 0x3df3
@@ -12,7 +13,6 @@
 
 #define HWCEXT_MAX_BASEADDR 9
 
-#define REG_PLLCTRL1 0x44
 #define PLL_REF_MHZ 14.31818
 typedef struct {
 	DWORD major;
@@ -98,10 +98,10 @@ DWORD hwc_ext_mhz_to_pll(int mhz)
 {
 	int n;
 
-	if (mhz < 150)
-		mhz = 150;
-	if (mhz > 220)
-		mhz = 220;
+	if (mhz < MXM_CLOCK_MIN_MHZ)
+		mhz = MXM_CLOCK_MIN_MHZ;
+	if (mhz > MXM_CLOCK_MAX_MHZ)
+		mhz = MXM_CLOCK_MAX_MHZ;
 
 	/*
 	 * Match the 3dfx H4 driver PLL table shape used for this range:
@@ -132,7 +132,7 @@ int hwc_ext_set_clock_mhz(hwc_ext_info_t *info, int mhz, char *err, int err_len)
 	}
 
 	pll = hwc_ext_mhz_to_pll(mhz);
-	pll_reg = (volatile DWORD *)(info->base0 + REG_PLLCTRL1);
+	pll_reg = (volatile DWORD *)(info->base0 + MXM_PLLCTRL1);
 	if (IsBadWritePtr((void *)pll_reg, sizeof(DWORD))) {
 		if (err && err_len)
 			lstrcpynA(err, "3dfx register mapping is not writable.", err_len);
@@ -198,8 +198,8 @@ static int probe_dc(HDC dc, UINT escape_id, hwc_ext_info_t *info)
 	info->num_base_addrs = res.opt.linear_addr.num_base_addrs;
 	info->base0 = res.opt.linear_addr.base_addresses[0];
 	base0 = info->base0;
-	if (base0 && !IsBadReadPtr((const void *)(base0 + REG_PLLCTRL1), sizeof(DWORD)))
-		info->pllctrl1 = *(volatile DWORD *)(base0 + REG_PLLCTRL1);
+	if (base0 && !IsBadReadPtr((const void *)(base0 + MXM_PLLCTRL1), sizeof(DWORD)))
+		info->pllctrl1 = *(volatile DWORD *)(base0 + MXM_PLLCTRL1);
 
 	if (process)
 		CloseHandle(process);

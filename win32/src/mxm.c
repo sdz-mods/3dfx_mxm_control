@@ -3,17 +3,6 @@
 #include <stdio.h>
 #include <string.h>
 
-#define XIO_VENDOR 0x104c
-#define XIO_DEVICE 0x8240
-#define SSVID_3DFX 0x4444
-
-#define MXM_GPIO_DIR  0xb4
-#define MXM_GPIO_DATA 0xb6
-#define MXM_GPIO_00   0x1c
-#define MXM_GPIO_01   0x1d
-#define MXM_GPIO_10   0x1e
-#define MXM_GPIO_11   0x1f
-
 #define NT_GPIO_STEP_MS 1
 #define WIN9X_GPIO_STEP_MS 3
 #define WIN9X_SAMPLE_SETTLE_MS 4
@@ -75,7 +64,7 @@ int mxm_detect(mxm_card_t *card)
 	last_error[0] = '\0';
 	mxm_card_clear(card);
 
-	if (pci_find_device(XIO_VENDOR, XIO_DEVICE, &card->bridge)) {
+	if (pci_find_device(MXM_XIO_VENDOR, MXM_XIO_DEVICE, &card->bridge)) {
 		set_error("TI XIO2001 bridge was not found.");
 		return -1;
 	}
@@ -89,7 +78,7 @@ int mxm_detect(mxm_card_t *card)
 		set_error("Failed to read MXM subsystem vendor ID.");
 		return -1;
 	}
-	if (ssvid != SSVID_3DFX) {
+	if (ssvid != MXM_SSVID_3DFX) {
 		set_error("XIO2001 bridge is not a 3dfx MXM card.");
 		return -1;
 	}
