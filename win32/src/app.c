@@ -2,6 +2,7 @@
 #include <commctrl.h>
 #include <shellapi.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "io_backend.h"
 #include "hwc_ext.h"
@@ -9,9 +10,10 @@
 #include "mxm.h"
 #include "resource.h"
 
-#define APP_VERSION "1.0"
+#define APP_VERSION "1.1"
 #define APP_TITLE "3dfx MXM Control " APP_VERSION
 #define WM_TRAYICON (WM_USER + 100)
+#define WM_APP_REFRESH (WM_USER + 101)
 
 enum {
 	ID_REFRESH = 1001,
@@ -23,6 +25,13 @@ enum {
 	ID_CLOCK,
 	ID_FB,
 	ID_BLANK,
+	ID_DOS43,
+	ID_SHARPNESS,
+	ID_CONTRAST,
+	ID_PEAKING,
+	ID_RGB_R,
+	ID_RGB_G,
+	ID_RGB_B,
 	ID_TRAY_OPEN,
 	ID_TRAY_REFRESH,
 	ID_TRAY_APPLY,
@@ -41,8 +50,35 @@ static int g_tray_visible;
 static int g_io_ready;
 static mxm_card_t g_card;
 static mxm_settings_t g_settings;
+static mxm_settings_t g_baseline;   /* last-known card state (for change detection) */
+static int g_pending_autostart_refresh;  /* autostarted: re-read on first tray open */
+static DWORD g_msp_idle_at;   /* tick when the MSP read state resets after a short read */
+
+static void refresh_card(void);
+static void refresh_status(void);
+
+/*
+ * A short status read stops the XIO transfer early, leaving the MSP's read
+ * state mid-block until its idle timeout. Block here until that has elapsed so
+ * the next full read/write can't desync. Only ever waits if the user acts
+ * within ~2 s of a first-open status refresh, which is rare.
+ */
+static void msp_wait_idle(void)
+{
+	if (g_msp_idle_at) {
+		DWORD now = GetTickCount();
+		if ((long)(g_msp_idle_at - now) > 0)
+			Sleep(g_msp_idle_at - now);
+		g_msp_idle_at = 0;
+	}
+}
 static hwc_ext_info_t g_hwc;
 static int g_clock_mhz = MXM_CLOCK_DEFAULT_MHZ;
+
+static HWND g_tab;
+#define MAX_TAB_CTRLS 40
+static HWND g_tab_ctrl[2][MAX_TAB_CTRLS];
+static int g_tab_n[2];
 
 static HWND lbl_backend;
 static HWND lbl_card;
@@ -59,6 +95,7 @@ static HWND lbl_gpu_temp;
 static HWND lbl_smc_temp;
 static HWND lbl_fan;
 static HWND lbl_raw;
+static HWND lbl_raw2;
 static HWND lbl_help;
 static HWND lbl_status;
 static HWND lbl_hwc;
@@ -70,6 +107,21 @@ static HWND chk_blank;
 static HWND btn_refresh;
 static HWND btn_apply;
 static HWND btn_defaults;
+static HWND chk_dos43;
+static HWND lbl_sharpness;
+static HWND trk_sharpness;
+static HWND lbl_contrast;
+static HWND trk_contrast;
+static HWND lbl_peaking;
+static HWND trk_peaking;
+static HWND lbl_rgb_r;
+static HWND trk_rgb_r;
+static HWND lbl_rgb_g;
+static HWND trk_rgb_g;
+static HWND lbl_rgb_b;
+static HWND trk_rgb_b;
+static HWND lbl_scaler_status;
+static HWND lbl_scaler_res;
 
 static HWND make_control(const char *cls, const char *text, DWORD style,
 			 int x, int y, int w, int h, int id)
@@ -96,9 +148,65 @@ static HWND make_hline(int x, int y, int w)
 	return make_control("STATIC", "", SS_ETCHEDHORZ, x, y, w, 2, 0);
 }
 
-static HWND make_vline(int x, int y, int h)
+static void tab_add(int tab, HWND h)
 {
-	return make_control("STATIC", "", SS_ETCHEDVERT, x, y, 2, h, 0);
+	if (h && g_tab_n[tab] < MAX_TAB_CTRLS)
+		g_tab_ctrl[tab][g_tab_n[tab]++] = h;
+}
+
+static void tab_select(int tab)
+{
+	int i;
+
+	for (i = 0; i < g_tab_n[0]; i++)
+		ShowWindow(g_tab_ctrl[0][i], tab == 0 ? SW_SHOW : SW_HIDE);
+	for (i = 0; i < g_tab_n[1]; i++)
+		ShowWindow(g_tab_ctrl[1][i], tab == 1 ? SW_SHOW : SW_HIDE);
+}
+
+static HWND make_tab_label(int tab, const char *text, int x, int y, int w, int h)
+{
+	HWND l = make_label(text, x, y, w, h);
+	tab_add(tab, l);
+	return l;
+}
+
+static HWND make_tab_group(int tab, const char *text, int x, int y, int w, int h)
+{
+	HWND g = make_group(text, x, y, w, h);
+	tab_add(tab, g);
+	return g;
+}
+
+static HWND make_tab_hline(int tab, int x, int y, int w)
+{
+	HWND l = make_hline(x, y, w);
+	tab_add(tab, l);
+	return l;
+}
+
+static HWND make_tab_vline(int tab, int x, int y, int h)
+{
+	HWND l = make_control("STATIC", "", SS_ETCHEDVERT, x, y, 2, h, 0);
+	tab_add(tab, l);
+	return l;
+}
+
+/* label + trackbar with the original shared geometry, registered on a tab */
+static HWND make_slider(int tab, int y, int id, int lo, int hi, int tick,
+			HWND *out_label)
+{
+	HWND lbl = make_label("", 28, y + 8, 210, 18);
+	HWND trk = make_control(TRACKBAR_CLASSA, "", WS_TABSTOP | TBS_AUTOTICKS,
+				250, y, 260, 40, id);
+
+	SendMessage(trk, TBM_SETRANGE, TRUE, MAKELONG(lo, hi));
+	SendMessage(trk, TBM_SETTICFREQ, tick, 0);
+	tab_add(tab, lbl);
+	tab_add(tab, trk);
+	if (out_label)
+		*out_label = lbl;
+	return trk;
 }
 
 static void set_text(HWND hwnd, const char *fmt, ...)
@@ -131,18 +239,32 @@ static void set_help_text(const char *text)
 static void show_help_contents(void)
 {
 	MessageBoxA(g_hwnd,
-		"3dfx MXM Control reads and writes settings stored on the MXM card.\r\n\r\n"
-		"Recommended defaults are 2.6 V for M4800/Napalm and 2.5 V for M3800/Avenger.\r\n\r\n"
-		"Panel Backlight and Core Voltage apply immediately after Apply.\r\n\r\n"
+		"3dfx MXM Control reads and writes settings stored on the MXM card.\r\n"
+		"Settings are grouped on two tabs.\r\n\r\n"
+		"CARD INFO & SETTINGS TAB\r\n"
+		"Recommended Core Voltage is 2.6 V for M4800/Napalm and 2.5 V for "
+		"M3800/Avenger.\r\n"
+		"Panel Backlight and Core Voltage apply immediately after Apply.\r\n"
 		"Core/Memory Clock applies immediately after Apply and is not stored "
-		"on the MXM card.\r\n\r\n"
-		"Framebuffer Memory is stored on the card, but takes effect after reboot. "
-		"64 MB is not recommended for Windows 98.\r\n\r\n"
-		"VSA NT Blank Fix is stored on the card. It takes effect after a resolution "
-		"change or display mode reset. It compensates for the NT VSA driver blanking issue.\r\n\r\n"
-		"Defaults loads safe values into the utility. Click Apply to store them on the card.\r\n\r\n"
-		"If video output is lost after bad card settings, use the BIOS setup recovery "
-		"option or spam R during SeaBIOS startup to restore MXM defaults.",
+		"on the card.\r\n"
+		"Framebuffer Memory is stored on the card and takes effect after reboot. "
+		"64 MB is not recommended for Windows 98.\r\n"
+		"VSA NT Blank Fix is stored on the card and takes effect after a "
+		"resolution change or display mode reset.\r\n\r\n"
+		"IMAGE & PANEL TAB\r\n"
+		"Force 4:3 for DOS modes pillarboxes DOS-era video modes - both text "
+		"modes and graphics modes (e.g. 640x400, 640x350, 720x350, 720x400) - "
+		"so they display in their intended 4:3 shape instead of stretched to "
+		"fill the panel. Stored on the card.\r\n"
+		"Peaking is the effective sharpness control (edge enhancement). "
+		"Sharpness (0-4) is the upscaler filter and is subtle.\r\n"
+		"Contrast and White Balance R/G/B apply live; White Balance 50 is "
+		"neutral. Lower a channel to warm or cool the image.\r\n\r\n"
+		"Defaults loads safe values into the utility. Click Apply to store them "
+		"on the card.\r\n\r\n"
+		"If video output is lost after a bad Core Voltage setting (the one "
+		"setting that can realistically cause this), use the BIOS setup recovery "
+		"option or spam R during SeaBIOS startup to restore defaults.",
 		"3dfx MXM Control Help", MB_OK | MB_ICONINFORMATION);
 }
 
@@ -185,6 +307,20 @@ static void show_main_window(void)
 	ShowWindow(g_hwnd, SW_SHOW);
 	ShowWindow(g_hwnd, SW_RESTORE);
 	SetForegroundWindow(g_hwnd);
+
+	/*
+	 * When the app autostarts at logon, the initial read happens while the
+	 * OS may not be driving a valid video signal yet, so the scaler reports
+	 * "no signal". Re-read once the first time the user opens the window.
+	 * Paint the window synchronously first, then post the (slow) read so it
+	 * displays immediately instead of blocking on the bit-banged transfer.
+	 */
+	if (g_pending_autostart_refresh) {
+		g_pending_autostart_refresh = 0;
+		RedrawWindow(g_hwnd, NULL, NULL,
+			     RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+		PostMessageA(g_hwnd, WM_APP_REFRESH, 0, 0);
+	}
 }
 
 static void hide_to_tray(void)
@@ -195,6 +331,8 @@ static void hide_to_tray(void)
 
 static void enable_card_controls(int enabled)
 {
+	int scaler = enabled && g_settings.scaler_capable;
+
 	EnableWindow(btn_apply, enabled);
 	EnableWindow(btn_defaults, enabled);
 	EnableWindow(trk_brightness, enabled);
@@ -202,18 +340,32 @@ static void enable_card_controls(int enabled)
 	EnableWindow(trk_clock, enabled && g_hwc.available);
 	EnableWindow(cbo_fb, enabled && g_card.type == MXM_CARD_M4800);
 	EnableWindow(chk_blank, enabled && g_card.type == MXM_CARD_M4800);
+
+	EnableWindow(chk_dos43, scaler);
+	EnableWindow(trk_sharpness, scaler);
+	EnableWindow(trk_contrast, scaler);
+	EnableWindow(trk_peaking, scaler);
+	EnableWindow(trk_rgb_r, scaler);
+	EnableWindow(trk_rgb_g, scaler);
+	EnableWindow(trk_rgb_b, scaler);
 }
 
-static void raw_packet_text(char *buf, int len)
+static void raw_line(char *buf, int len, int start, int count)
 {
-	wsprintfA(buf, "%02X %02X %02X %02X %02X",
-		  g_settings.raw[0], g_settings.raw[1], g_settings.raw[2],
-		  g_settings.raw[3], g_settings.raw[4]);
+	int i;
+	int pos = 0;
+
+	buf[0] = '\0';
+	for (i = start; i < start + count && pos < len - 4; i++)
+		pos += wsprintfA(buf + pos, (i > start) ? " %02X" : "%02X",
+				 g_settings.raw[i]);
 }
 
 static void update_value_labels(void)
 {
-	char raw[32];
+	int n = g_settings.scaler_capable ? MXM_READ_BYTES : 5;
+	char l1[48];
+	char l2[48];
 
 	set_text(lbl_brightness, "Panel Backlight: %d%%", g_settings.brightness);
 	set_text(lbl_vcore, "Core Voltage: %d.%d V",
@@ -228,8 +380,39 @@ static void update_value_labels(void)
 	set_text(lbl_gpu_temp, "GPU Temperature: %d C", g_settings.gpu_temp);
 	set_text(lbl_smc_temp, "SMC Temperature: %d C", g_settings.smc_temp);
 	set_text(lbl_fan, "Fan Speed: %d%%", g_settings.fan_speed);
-	raw_packet_text(raw, sizeof(raw));
-	set_text(lbl_raw, "Raw Packet: %s", raw);
+	if (n > 10) {
+		raw_line(l1, sizeof(l1), 0, 10);
+		raw_line(l2, sizeof(l2), 10, n - 10);
+	} else {
+		raw_line(l1, sizeof(l1), 0, n);
+		l2[0] = '\0';
+	}
+	set_text(lbl_raw, "Raw Packet: %s", l1);
+	SetWindowTextA(lbl_raw2, l2);
+
+	set_text(lbl_sharpness, "Sharpness: %d", g_settings.sharpness);
+	set_text(lbl_contrast, "Contrast: %d", g_settings.contrast);
+	set_text(lbl_peaking, "Peaking (edge enhance): %d", g_settings.peaking);
+	set_text(lbl_rgb_r, "White balance R: %d", g_settings.rgb_r);
+	set_text(lbl_rgb_g, "White balance G: %d", g_settings.rgb_g);
+	set_text(lbl_rgb_b, "White balance B: %d", g_settings.rgb_b);
+
+	if (!g_settings.scaler_capable) {
+		SetWindowTextA(lbl_scaler_status,
+			       "Scaler: requires MSP firmware v2 (not detected)");
+		SetWindowTextA(lbl_scaler_res, "");
+	} else if (!g_settings.scaler_link) {
+		SetWindowTextA(lbl_scaler_status, "Scaler: no UART link");
+		SetWindowTextA(lbl_scaler_res, "");
+	} else {
+		set_text(lbl_scaler_status, "Scaler: linked, %s",
+			 g_settings.scaler_lock ? "signal locked" : "no signal");
+		if (g_settings.scaler_lock)
+			set_text(lbl_scaler_res, "Input resolution: %d x %d",
+				 g_settings.in_width, g_settings.in_height);
+		else
+			SetWindowTextA(lbl_scaler_res, "Input resolution: -");
+	}
 }
 
 static void update_default_help(void)
@@ -254,6 +437,23 @@ static void show_setting_help(int id)
 		break;
 	case ID_BLANK:
 		set_help_text("Blank Fix is stored on the MXM card and takes effect after a resolution change or display mode reset.");
+		break;
+	case ID_DOS43:
+		set_help_text("Force 4:3 pillarboxes DOS-era video modes - both text modes and graphics modes (e.g. 640x400, 640x350, 720x350, 720x400) - so they display in their intended 4:3 shape instead of stretched to fill the panel. Stored on the card.");
+		break;
+	case ID_SHARPNESS:
+		set_help_text("Scaler upscale filter (0-4). Effect is subtle; use Peaking for visible sharpening. Applies live.");
+		break;
+	case ID_CONTRAST:
+		set_help_text("Scaler contrast (0-100). Applies live to the displayed image.");
+		break;
+	case ID_PEAKING:
+		set_help_text("Edge enhancement / sharpening (0-100, 0 = off). The effective sharpness control.");
+		break;
+	case ID_RGB_R:
+	case ID_RGB_G:
+	case ID_RGB_B:
+		set_help_text("White balance gain per channel (0-100, 50 = neutral). Lower a channel to warm or cool the image. Applies live.");
 		break;
 	default:
 		update_default_help();
@@ -281,6 +481,15 @@ static void settings_to_controls(void)
 		SendMessage(cbo_fb, CB_SETCURSEL, 0, 0);
 	SendMessage(chk_blank, BM_SETCHECK,
 		    g_settings.blank_fix ? BST_CHECKED : BST_UNCHECKED, 0);
+
+	SendMessage(chk_dos43, BM_SETCHECK,
+		    g_settings.dos43 ? BST_CHECKED : BST_UNCHECKED, 0);
+	SendMessage(trk_sharpness, TBM_SETPOS, TRUE, g_settings.sharpness);
+	SendMessage(trk_contrast, TBM_SETPOS, TRUE, g_settings.contrast);
+	SendMessage(trk_peaking, TBM_SETPOS, TRUE, g_settings.peaking);
+	SendMessage(trk_rgb_r, TBM_SETPOS, TRUE, g_settings.rgb_r);
+	SendMessage(trk_rgb_g, TBM_SETPOS, TRUE, g_settings.rgb_g);
+	SendMessage(trk_rgb_b, TBM_SETPOS, TRUE, g_settings.rgb_b);
 	update_value_labels();
 }
 
@@ -298,6 +507,17 @@ static void controls_to_settings(void)
 		g_settings.fb_mb = 16;
 	g_settings.blank_fix = g_card.type == MXM_CARD_M4800
 		? SendMessage(chk_blank, BM_GETCHECK, 0, 0) == BST_CHECKED : 1;
+
+	if (g_settings.scaler_capable) {
+		g_settings.dos43 =
+			SendMessage(chk_dos43, BM_GETCHECK, 0, 0) == BST_CHECKED;
+		g_settings.sharpness = (int)SendMessage(trk_sharpness, TBM_GETPOS, 0, 0);
+		g_settings.contrast = (int)SendMessage(trk_contrast, TBM_GETPOS, 0, 0);
+		g_settings.peaking = (int)SendMessage(trk_peaking, TBM_GETPOS, 0, 0);
+		g_settings.rgb_r = (int)SendMessage(trk_rgb_r, TBM_GETPOS, 0, 0);
+		g_settings.rgb_g = (int)SendMessage(trk_rgb_g, TBM_GETPOS, 0, 0);
+		g_settings.rgb_b = (int)SendMessage(trk_rgb_b, TBM_GETPOS, 0, 0);
+	}
 	update_value_labels();
 }
 
@@ -323,6 +543,7 @@ static void update_card_labels(void)
 
 static void refresh_card(void)
 {
+	msp_wait_idle();
 	enable_card_controls(0);
 	mxm_card_clear(&g_card);
 	hwc_ext_probe(g_hwnd, &g_hwc);
@@ -348,10 +569,34 @@ static void refresh_card(void)
 		set_status("%s", mxm_last_error());
 		return;
 	}
+	g_baseline = g_settings;
 
 	settings_to_controls();
 	enable_card_controls(1);
 	SetWindowTextA(lbl_hwc, g_hwc.status);
+	set_status("Ready.");
+}
+
+/*
+ * Lightweight re-read for the first tray open after autostart. The card was
+ * already detected at startup, so skip the PCI re-detection and the driver
+ * probe and just re-read the settings/status block (which carries the live
+ * scaler link, lock and input resolution). Falls back to a full refresh if
+ * the card was not detected at startup.
+ */
+static void refresh_status(void)
+{
+	if (!g_io_ready || !g_card.present) {
+		refresh_card();
+		return;
+	}
+	if (mxm_read_status(&g_card, &g_settings)) {
+		set_status("%s", mxm_last_error());
+		return;
+	}
+	/* short read leaves the MSP mid-block; guard the next transaction */
+	g_msp_idle_at = GetTickCount() + 2100;
+	update_value_labels();
 	set_status("Ready.");
 }
 
@@ -369,7 +614,8 @@ static void apply_settings(void)
 	desired_clock = g_clock_mhz;
 	enable_card_controls(0);
 	set_status("Applying settings...");
-	if (mxm_write_settings(&g_card, &desired)) {
+	msp_wait_idle();
+	if (mxm_write_settings(&g_card, &desired, &g_baseline)) {
 		set_status("%s", mxm_last_error());
 		enable_card_controls(1);
 		return;
@@ -383,6 +629,7 @@ static void apply_settings(void)
 	}
 
 	g_settings = desired;
+	g_baseline = desired;   /* card now holds these; next Apply diffs against them */
 	if (g_hwc.available)
 		g_clock_mhz = hwc_ext_pll_to_mhz(g_hwc.pllctrl1);
 	settings_to_controls();
@@ -393,25 +640,27 @@ static void apply_settings(void)
 
 static void load_defaults(void)
 {
-	int gpu_temp;
-	int smc_temp;
-	int fan_speed;
-	BYTE raw[5];
+	mxm_settings_t live;
 
 	if (!g_card.present)
 		return;
 
-	gpu_temp = g_settings.gpu_temp;
-	smc_temp = g_settings.smc_temp;
-	fan_speed = g_settings.fan_speed;
-	memcpy(raw, g_settings.raw, sizeof(raw));
-
+	/* keep the live/telemetry/capability fields; only reset the settings */
+	live = g_settings;
 	mxm_defaults(&g_card, &g_settings);
 	g_clock_mhz = MXM_CLOCK_DEFAULT_MHZ;
-	g_settings.gpu_temp = gpu_temp;
-	g_settings.smc_temp = smc_temp;
-	g_settings.fan_speed = fan_speed;
-	memcpy(g_settings.raw, raw, sizeof(raw));
+
+	g_settings.proto_version = live.proto_version;
+	g_settings.scaler_capable = live.scaler_capable;
+	g_settings.gpu_temp = live.gpu_temp;
+	g_settings.smc_temp = live.smc_temp;
+	g_settings.fan_speed = live.fan_speed;
+	g_settings.scaler_link = live.scaler_link;
+	g_settings.scaler_lock = live.scaler_lock;
+	g_settings.in_width = live.in_width;
+	g_settings.in_height = live.in_height;
+	memcpy(g_settings.raw, live.raw, sizeof(g_settings.raw));
+
 	settings_to_controls();
 	set_status("Defaults loaded. Click Apply to store them on the card.");
 }
@@ -419,76 +668,95 @@ static void load_defaults(void)
 static void create_ui(void)
 {
 	HWND logo;
+	TCITEMA tie;
 
 	g_font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
 
-	logo = make_control("STATIC", "", SS_ICON, 18, 14, 32, 32, 0);
+	logo = make_control("STATIC", "", SS_ICON, 16, 10, 32, 32, 0);
 	SendMessage(logo, STM_SETICON, (WPARAM)g_icon, 0);
-	make_label("Unified M3800/M4800 control panel", 60, 24, 300, 18);
+	make_label("Unified M3800/M4800 control panel", 58, 20, 320, 18);
 
-	make_group("Card Information", 12, 58, 580, 114);
-	lbl_card = make_label("Card Model:", 28, 82, 255, 18);
-	lbl_gpu = make_label("GPU Model:", 28, 106, 255, 18);
-	lbl_revision = make_label("Card Revision:", 28, 130, 255, 18);
-	make_vline(300, 80, 74);
-	lbl_display = make_label("Display Type:", 318, 82, 245, 18);
-	lbl_bridge = make_label("Bridge:", 318, 106, 245, 18);
-	lbl_raw = make_label("Raw Packet:", 318, 130, 245, 18);
+	g_tab = make_control(WC_TABCONTROLA, "", WS_TABSTOP, 8, 50, 600, 486, 0);
+	memset(&tie, 0, sizeof(tie));
+	tie.mask = TCIF_TEXT;
+	tie.pszText = (LPSTR)"Card Info && Settings";
+	SendMessage(g_tab, TCM_INSERTITEMA, 0, (LPARAM)&tie);
+	tie.pszText = (LPSTR)"Image && Panel";
+	SendMessage(g_tab, TCM_INSERTITEMA, 1, (LPARAM)&tie);
 
-	make_group("Live Status", 12, 182, 580, 58);
-	lbl_gpu_temp = make_label("GPU Temperature:", 28, 204, 170, 18);
-	lbl_smc_temp = make_label("SMC Temperature:", 218, 204, 170, 18);
-	lbl_fan = make_label("Fan Speed:", 408, 204, 150, 18);
+	/* ---- Tab 0: Card Info & Settings (original appearance, no backlight) ---- */
+	make_tab_group(0, "Card Information", 16, 78, 580, 120);
+	lbl_card     = make_tab_label(0, "Card Model:", 28, 102, 255, 18);
+	lbl_gpu      = make_tab_label(0, "GPU Model:", 28, 126, 255, 18);
+	lbl_revision = make_tab_label(0, "Card Revision:", 28, 150, 255, 18);
+	make_tab_vline(0, 300, 100, 86);
+	lbl_display  = make_tab_label(0, "Display Type:", 318, 102, 270, 18);
+	lbl_bridge   = make_tab_label(0, "Bridge:", 318, 126, 270, 18);
+	lbl_raw      = make_tab_label(0, "Raw Packet:", 318, 150, 270, 18);
+	lbl_raw2     = make_tab_label(0, "", 318, 168, 270, 18);
 
-	make_group("Driver Interface", 12, 250, 580, 58);
-	lbl_hwc = make_label("3dfx driver interface:", 28, 272, 548, 18);
+	make_tab_group(0, "Live Status", 16, 206, 580, 58);
+	lbl_gpu_temp = make_tab_label(0, "GPU Temperature:", 28, 228, 190, 18);
+	lbl_smc_temp = make_tab_label(0, "SMC Temperature:", 228, 228, 180, 18);
+	lbl_fan      = make_tab_label(0, "Fan Speed:", 418, 228, 150, 18);
 
-	make_group("Card Settings", 12, 318, 580, 244);
-	lbl_brightness = make_label("Panel Backlight:", 28, 346, 210, 18);
-	trk_brightness = make_control(TRACKBAR_CLASSA, "", WS_TABSTOP | TBS_AUTOTICKS,
-				     250, 338, 260, 40, ID_BRIGHTNESS);
-	SendMessage(trk_brightness, TBM_SETRANGE, TRUE, MAKELONG(10, 100));
-	SendMessage(trk_brightness, TBM_SETTICFREQ, 10, 0);
+	make_tab_group(0, "Driver Interface", 16, 272, 580, 58);
+	lbl_hwc = make_tab_label(0, "3dfx driver interface:", 28, 294, 548, 18);
 
-	lbl_vcore = make_label("Core Voltage:", 28, 386, 210, 18);
-	trk_vcore = make_control(TRACKBAR_CLASSA, "", WS_TABSTOP | TBS_AUTOTICKS,
-				250, 378, 260, 40, ID_VCORE);
-	SendMessage(trk_vcore, TBM_SETRANGE, TRUE, MAKELONG(25, 31));
-	SendMessage(trk_vcore, TBM_SETTICFREQ, 1, 0);
-
-	lbl_clock = make_label("Core/Memory Clock:", 28, 426, 210, 18);
-	trk_clock = make_control(TRACKBAR_CLASSA, "", WS_TABSTOP | TBS_AUTOTICKS,
-				 250, 418, 260, 40, ID_CLOCK);
-	SendMessage(trk_clock, TBM_SETRANGE, TRUE,
-		    MAKELONG(MXM_CLOCK_MIN_MHZ, MXM_CLOCK_MAX_MHZ));
-	SendMessage(trk_clock, TBM_SETTICFREQ, 10, 0);
-
-	make_hline(24, 464, 552);
-	lbl_fb = make_label("Framebuffer Memory:", 28, 482, 210, 18);
+	make_tab_group(0, "Card Settings", 16, 338, 580, 186);
+	trk_vcore = make_slider(0, 358, ID_VCORE, 25, 31, 1, &lbl_vcore);
+	trk_clock = make_slider(0, 398, ID_CLOCK, MXM_CLOCK_MIN_MHZ,
+				MXM_CLOCK_MAX_MHZ, 10, &lbl_clock);
+	make_tab_hline(0, 24, 444, 552);
+	lbl_fb = make_tab_label(0, "Framebuffer Memory:", 28, 464, 210, 18);
 	cbo_fb = make_control("COMBOBOX", "", WS_TABSTOP | CBS_DROPDOWNLIST,
-			      262, 478, 120, 100, ID_FB);
-
-	lbl_blank = make_label("VSA NT Blank Fix:", 28, 516, 210, 18);
+			      262, 460, 120, 100, ID_FB);
+	tab_add(0, cbo_fb);
+	lbl_blank = make_tab_label(0, "VSA NT Blank Fix:", 28, 498, 210, 18);
 	chk_blank = make_control("BUTTON", "Enable", WS_TABSTOP | BS_AUTOCHECKBOX,
-				 262, 512, 90, 22, ID_BLANK);
+				 262, 494, 90, 22, ID_BLANK);
+	tab_add(0, chk_blank);
 
-	make_group("Setting Notes", 12, 572, 580, 82);
-	lbl_help = make_label("", 28, 596, 548, 34);
+	/* ---- Tab 1: Image & Panel (backlight + scaler) ---- */
+	make_tab_group(1, "Panel", 16, 78, 580, 60);
+	trk_brightness = make_slider(1, 94, ID_BRIGHTNESS, 10, 100, 10, &lbl_brightness);
 
-	make_hline(12, 666, 580);
+	make_tab_group(1, "Image / Scaler Settings", 16, 146, 580, 320);
+	chk_dos43 = make_control("BUTTON", "Force 4:3 for DOS modes",
+				 WS_TABSTOP | BS_AUTOCHECKBOX, 28, 168, 420, 22,
+				 ID_DOS43);
+	tab_add(1, chk_dos43);
+	make_tab_hline(1, 24, 198, 552);
+	trk_sharpness = make_slider(1, 208, ID_SHARPNESS, 0, 4, 1, &lbl_sharpness);
+	trk_contrast  = make_slider(1, 248, ID_CONTRAST, 0, 100, 10, &lbl_contrast);
+	trk_peaking   = make_slider(1, 288, ID_PEAKING, 0, 100, 10, &lbl_peaking);
+	make_tab_hline(1, 24, 334, 552);
+	trk_rgb_r = make_slider(1, 344, ID_RGB_R, 0, 100, 10, &lbl_rgb_r);
+	trk_rgb_g = make_slider(1, 384, ID_RGB_G, 0, 100, 10, &lbl_rgb_g);
+	trk_rgb_b = make_slider(1, 424, ID_RGB_B, 0, 100, 10, &lbl_rgb_b);
+
+	make_tab_group(1, "Scaler Status", 16, 474, 580, 50);
+	lbl_scaler_status = make_tab_label(1, "Scaler:", 28, 494, 340, 18);
+	lbl_scaler_res    = make_tab_label(1, "", 372, 494, 210, 18);
+
+	/* ---- shared bottom ---- */
+	make_group("Setting Notes", 12, 544, 600, 74);
+	lbl_help = make_label("", 28, 564, 572, 46);
+
 	btn_refresh = make_control("BUTTON", "Refresh", WS_TABSTOP | BS_PUSHBUTTON,
-				   20, 680, 88, 28, ID_REFRESH);
+				   20, 626, 88, 28, ID_REFRESH);
 	btn_apply = make_control("BUTTON", "Apply", WS_TABSTOP | BS_PUSHBUTTON,
-				 118, 680, 88, 28, ID_APPLY);
+				 118, 626, 88, 28, ID_APPLY);
 	btn_defaults = make_control("BUTTON", "Defaults", WS_TABSTOP | BS_PUSHBUTTON,
-				    216, 680, 88, 28, ID_DEFAULTS);
+				    216, 626, 88, 28, ID_DEFAULTS);
 	make_control("BUTTON", "Exit", WS_TABSTOP | BS_PUSHBUTTON,
-		     314, 680, 88, 28, ID_EXIT);
+		     314, 626, 88, 28, ID_EXIT);
 
-	lbl_backend = make_label("Backend:", 12, 720, 230, 18);
-	lbl_status = make_label("Starting...", 252, 720, 330, 18);
+	lbl_backend = make_label("Backend:", 12, 664, 230, 18);
+	lbl_status = make_label("Starting...", 252, 664, 350, 18);
 	update_default_help();
 	enable_card_controls(0);
+	tab_select(0);
 }
 
 static void show_tray_menu(void)
@@ -521,6 +789,20 @@ static void create_main_menu(HWND hwnd)
 	SetMenu(hwnd, menu);
 }
 
+static int trk_setting_id(HWND h)
+{
+	if (h == trk_brightness) return ID_BRIGHTNESS;
+	if (h == trk_vcore)      return ID_VCORE;
+	if (h == trk_clock)      return ID_CLOCK;
+	if (h == trk_sharpness)  return ID_SHARPNESS;
+	if (h == trk_contrast)   return ID_CONTRAST;
+	if (h == trk_peaking)    return ID_PEAKING;
+	if (h == trk_rgb_r)      return ID_RGB_R;
+	if (h == trk_rgb_g)      return ID_RGB_G;
+	if (h == trk_rgb_b)      return ID_RGB_B;
+	return 0;
+}
+
 static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
 	switch (msg) {
@@ -547,24 +829,23 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		}
 		return 0;
 	}
-	case WM_HSCROLL:
-		if ((HWND)lp == trk_brightness)
-			show_setting_help(ID_BRIGHTNESS);
-		else if ((HWND)lp == trk_vcore)
-			show_setting_help(ID_VCORE);
-		else if ((HWND)lp == trk_clock)
-			show_setting_help(ID_CLOCK);
+	case WM_HSCROLL: {
+		int sid = trk_setting_id((HWND)lp);
+		if (sid)
+			show_setting_help(sid);
 		controls_to_settings();
 		return 0;
+	}
 	case WM_NOTIFY: {
 		NMHDR *hdr = (NMHDR *)lp;
+		if (hdr && hdr->hwndFrom == g_tab && hdr->code == TCN_SELCHANGE) {
+			tab_select((int)SendMessage(g_tab, TCM_GETCURSEL, 0, 0));
+			return 0;
+		}
 		if (hdr && hdr->code == NM_SETFOCUS) {
-			if (hdr->hwndFrom == trk_brightness)
-				show_setting_help(ID_BRIGHTNESS);
-			else if (hdr->hwndFrom == trk_vcore)
-				show_setting_help(ID_VCORE);
-			else if (hdr->hwndFrom == trk_clock)
-				show_setting_help(ID_CLOCK);
+			int sid = trk_setting_id(hdr->hwndFrom);
+			if (sid)
+				show_setting_help(sid);
 		}
 		break;
 	}
@@ -605,6 +886,10 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 			show_setting_help(ID_BLANK);
 			controls_to_settings();
 			return 0;
+		case ID_DOS43:
+			show_setting_help(ID_DOS43);
+			controls_to_settings();
+			return 0;
 		}
 		break;
 	case WM_SIZE:
@@ -617,6 +902,9 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		else if (lp == WM_RBUTTONUP)
 			show_tray_menu();
 		return 0;
+	case WM_APP_REFRESH:
+		refresh_status();
+		return 0;
 	case WM_DESTROY:
 		tray_update(0);
 		io_shutdown();
@@ -627,10 +915,26 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 	return DefWindowProc(hwnd, msg, wp, lp);
 }
 
+/* case-insensitive test for a "/opt" or "-opt" flag on the command line */
+static int cmd_has(LPSTR cmd, const char *opt)
+{
+	char buf[256];
+
+	if (!cmd)
+		return 0;
+	lstrcpynA(buf, cmd, sizeof(buf));
+	CharLowerA(buf);
+	return strstr(buf, opt) != NULL;
+}
+
 int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
 {
 	WNDCLASSA wc;
 	MSG msg;
+	int start_tray;
+
+	start_tray = cmd_has(cmd, "/tray") || cmd_has(cmd, "-tray");
+	g_pending_autostart_refresh = start_tray;
 
 	g_inst = inst;
 	memset(&wc, 0, sizeof(wc));
@@ -643,16 +947,36 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
 	if (!RegisterClassA(&wc))
 		return 1;
 
-	g_hwnd = CreateWindowExA(0, wc.lpszClassName, APP_TITLE,
-				 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
-				 WS_MINIMIZEBOX,
-				 CW_USEDEFAULT, CW_USEDEFAULT, 620, 795,
-				 NULL, NULL, inst, NULL);
+	{
+		/*
+		 * Size the window from the desired CLIENT area so the layout fits
+		 * regardless of the OS title-bar/border height. A fixed total size
+		 * clips the bottom on XP/Vista+ (taller caption) vs Win98 classic.
+		 */
+		DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+		RECT rc;
+
+		rc.left = 0;
+		rc.top = 0;
+		rc.right = 620;   /* client width  */
+		rc.bottom = 690;  /* client height */
+		AdjustWindowRect(&rc, style, TRUE);   /* TRUE: window has a menu */
+
+		g_hwnd = CreateWindowExA(0, wc.lpszClassName, APP_TITLE, style,
+					 CW_USEDEFAULT, CW_USEDEFAULT,
+					 rc.right - rc.left, rc.bottom - rc.top,
+					 NULL, NULL, inst, NULL);
+	}
 	if (!g_hwnd)
 		return 1;
 
-	ShowWindow(g_hwnd, show);
-	UpdateWindow(g_hwnd);
+	if (start_tray) {
+		/* launched at logon: stay hidden, just show the tray icon */
+		tray_update(1);
+	} else {
+		ShowWindow(g_hwnd, show);
+		UpdateWindow(g_hwnd);
+	}
 
 	while (GetMessage(&msg, NULL, 0, 0)) {
 		TranslateMessage(&msg);

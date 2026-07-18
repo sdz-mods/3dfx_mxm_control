@@ -101,6 +101,44 @@ static void gpio_write(const mxm_card_t *card, u8 value)
 	pci_write8(card->bridge, MXM_GPIO_DATA, value);
 }
 
+static void decode_legacy(const mxm_card_t *card, mxm_settings_t *s)
+{
+	s->brightness = s->raw[0];
+	s->vcore_deci = ((s->raw[1] >> 4) & 0x07) + 25;
+	s->fb_mb = card->type == MXM_CARD_M4800
+		? (((s->raw[1] >> 3) & 1) ? 64 : 32) : 16;
+	s->blank_fix = card->type == MXM_CARD_M4800
+		? ((s->raw[1] >> 2) & 1) : 1;
+	s->gpu_temp = s->raw[2];
+	s->smc_temp = s->raw[3];
+	s->fan_speed = s->raw[4];
+	s->scaler_capable = 0;
+}
+
+static void decode_v2(mxm_settings_t *s)
+{
+	/* v2 20-byte block; live data first, then settings. See mxm_protocol.h */
+	s->scaler_link = (s->raw[1] & 0x01) ? 1 : 0;
+	s->scaler_lock = (s->raw[1] & 0x02) ? 1 : 0;
+	s->in_width = s->raw[2] | ((int)s->raw[3] << 8);
+	s->in_height = s->raw[4] | ((int)s->raw[5] << 8);
+	s->gpu_temp = s->raw[6];
+	s->smc_temp = s->raw[7];
+	s->fan_speed = s->raw[8];
+	s->brightness = s->raw[9];
+	s->vcore_deci = s->raw[10] + 25;
+	s->fb_mb = s->raw[11] ? 64 : 32;
+	s->blank_fix = s->raw[12];
+	s->dos43 = s->raw[13];
+	s->sharpness = s->raw[14];
+	s->contrast = s->raw[15];
+	s->peaking = s->raw[16];
+	s->rgb_r = s->raw[17];
+	s->rgb_g = s->raw[18];
+	s->rgb_b = s->raw[19];
+	s->scaler_capable = 1;
+}
+
 int mxm_read_settings(const mxm_card_t *card, mxm_settings_t *settings)
 {
 	int bit;
@@ -117,7 +155,7 @@ int mxm_read_settings(const mxm_card_t *card, mxm_settings_t *settings)
 	gpio_write(card, MXM_GPIO_11);
 	delay_ms(200);
 
-	for (bit = 0; bit < 40; bit++) {
+	for (bit = 0; bit < MXM_READ_BYTES * 8; bit++) {
 		u8 data;
 
 		gpio_write(card, MXM_GPIO_10);
@@ -130,21 +168,18 @@ int mxm_read_settings(const mxm_card_t *card, mxm_settings_t *settings)
 		if (bit > 0 && ((bit + 1) % 8) == 0)
 			byte_index++;
 	}
+	gpio_write(card, MXM_GPIO_10);
 
-	settings->brightness = settings->raw[0];
+	settings->proto_version = settings->raw[0];
+	if (settings->proto_version == MXM_PROTO_VERSION)
+		decode_v2(settings);
+	else
+		decode_legacy(card, settings);
+
 	if (settings->brightness < 10)
 		settings->brightness = 10;
 	if (settings->brightness > 100)
 		settings->brightness = 100;
-	settings->vcore_deci = ((settings->raw[1] >> 4) & 0x07) + 25;
-	settings->fb_mb = card->type == MXM_CARD_M4800
-		? (((settings->raw[1] >> 3) & 1) ? 64 : 32) : 16;
-	settings->blank_fix = card->type == MXM_CARD_M4800
-		? ((settings->raw[1] >> 2) & 1) : 1;
-	settings->gpu_temp = settings->raw[2];
-	settings->smc_temp = settings->raw[3];
-	settings->fan_speed = settings->raw[4];
-	gpio_write(card, MXM_GPIO_10);
 	return 0;
 }
 
@@ -164,10 +199,24 @@ static void send_byte(const mxm_card_t *card, u8 packet)
 	delay_ms(DOS_PACKET_GAP_MS);
 }
 
-int mxm_write_settings(const mxm_card_t *card,
-		       const mxm_settings_t *settings)
+static void write_register(const mxm_card_t *card, u8 index, u8 value)
 {
-	u8 packet0;
+	/* v2 write transaction is [index, value]; index MSB (0) selects write */
+	send_byte(card, index);
+	send_byte(card, value);
+}
+
+/* write reg only when prev is NULL (force) or the field changed */
+#define WR_IF(field, idx, val) \
+	do { \
+		if (!prev || prev->field != settings->field) \
+			write_register(card, (u8)(idx), (u8)(val)); \
+	} while (0)
+
+int mxm_write_settings(const mxm_card_t *card,
+		       const mxm_settings_t *settings,
+		       const mxm_settings_t *prev)
+{
 	u8 packet1;
 	int vcore_code;
 
@@ -176,37 +225,66 @@ int mxm_write_settings(const mxm_card_t *card,
 		return -1;
 	}
 
-	packet0 = (u8)settings->brightness;
 	vcore_code = settings->vcore_deci - 25;
 	if (vcore_code < 0)
 		vcore_code = 0;
 	if (vcore_code > 6)
 		vcore_code = 6;
-	packet1 = (u8)(vcore_code << 4);
-	if (card->type == MXM_CARD_M4800) {
-		if (settings->fb_mb == 64)
-			packet1 |= 0x08;
-		if (settings->blank_fix)
-			packet1 |= 0x04;
+
+	if (!settings->scaler_capable) {
+		/* legacy firmware: single combined packet, always written */
+		packet1 = (u8)(vcore_code << 4);
+		if (card->type == MXM_CARD_M4800) {
+			if (settings->fb_mb == 64)
+				packet1 |= 0x08;
+			if (settings->blank_fix)
+				packet1 |= 0x04;
+		}
+		send_byte(card, (u8)settings->brightness);
+		send_byte(card, packet1);
+		return 0;
 	}
 
-	send_byte(card, packet0);
-	send_byte(card, packet1);
+	WR_IF(brightness, MXM_REG_BACKLIGHT, settings->brightness);
+	WR_IF(vcore_deci, MXM_REG_VCORE, vcore_code);
+	WR_IF(fb_mb, MXM_REG_FBSIZE, settings->fb_mb == 64 ? 1 : 0);
+	WR_IF(blank_fix, MXM_REG_BLANK_FIX, settings->blank_fix ? 1 : 0);
+	WR_IF(dos43, MXM_REG_DOS43, settings->dos43 ? 1 : 0);
+	WR_IF(sharpness, MXM_REG_SHARPNESS, settings->sharpness);
+	WR_IF(contrast, MXM_REG_CONTRAST, settings->contrast);
+	WR_IF(peaking, MXM_REG_PEAKING, settings->peaking);
+	WR_IF(rgb_r, MXM_REG_RGB_R, settings->rgb_r);
+	WR_IF(rgb_g, MXM_REG_RGB_G, settings->rgb_g);
+	WR_IF(rgb_b, MXM_REG_RGB_B, settings->rgb_b);
 	return 0;
 }
 
 void mxm_defaults(const mxm_card_t *card, mxm_settings_t *settings)
 {
-	int gpu_temp = settings->gpu_temp;
-	int smc_temp = settings->smc_temp;
-	int fan_speed = settings->fan_speed;
+	mxm_settings_t live = *settings;   /* keep live/read-only fields */
 
 	memset(settings, 0, sizeof(*settings));
 	settings->brightness = 100;
 	settings->vcore_deci = card->type == MXM_CARD_M4800 ? 26 : 25;
 	settings->fb_mb = card->type == MXM_CARD_M4800 ? 32 : 16;
 	settings->blank_fix = card->type == MXM_CARD_M4800 ? 0 : 1;
-	settings->gpu_temp = gpu_temp;
-	settings->smc_temp = smc_temp;
-	settings->fan_speed = fan_speed;
+	/* scaler defaults (match the RTD firmware) */
+	settings->dos43 = 1;
+	settings->sharpness = 2;
+	settings->contrast = 40;
+	settings->peaking = 0;
+	settings->rgb_r = 50;
+	settings->rgb_g = 50;
+	settings->rgb_b = 50;
+	/* restore live / read-only fields */
+	settings->proto_version = live.proto_version;
+	settings->scaler_capable = live.scaler_capable;
+	settings->gpu_temp = live.gpu_temp;
+	settings->smc_temp = live.smc_temp;
+	settings->fan_speed = live.fan_speed;
+	settings->scaler_link = live.scaler_link;
+	settings->scaler_lock = live.scaler_lock;
+	settings->in_width = live.in_width;
+	settings->in_height = live.in_height;
+	memcpy(settings->raw, live.raw, sizeof(settings->raw));
 }

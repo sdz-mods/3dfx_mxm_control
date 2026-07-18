@@ -141,6 +141,51 @@ static void packet_gap_delay(void)
 		Sleep(WIN9X_PACKET_GAP_MS);
 }
 
+static void decode_legacy(const mxm_card_t *card, mxm_settings_t *s)
+{
+	/* old 5-byte firmware: [backlight, packed vcore/fb/blank, gpuT, smcT, fan] */
+	s->brightness = s->raw[0];
+	s->vcore_deci = ((s->raw[1] >> 4) & 0x07) + 25;
+	s->fb_mb = card->type == MXM_CARD_M4800
+		? (((s->raw[1] >> 3) & 1) ? 64 : 32) : 16;
+	s->blank_fix = card->type == MXM_CARD_M4800
+		? ((s->raw[1] >> 2) & 1) : 1;
+	s->gpu_temp = s->raw[2];
+	s->smc_temp = s->raw[3];
+	s->fan_speed = s->raw[4];
+	s->scaler_capable = 0;
+}
+
+/* scaler live status = leading bytes [1..5] (read by a short "status" read) */
+static void decode_status(mxm_settings_t *s)
+{
+	s->scaler_link = (s->raw[1] & 0x01) ? 1 : 0;
+	s->scaler_lock = (s->raw[1] & 0x02) ? 1 : 0;
+	s->in_width = s->raw[2] | ((int)s->raw[3] << 8);
+	s->in_height = s->raw[4] | ((int)s->raw[5] << 8);
+	s->scaler_capable = 1;
+}
+
+static void decode_v2(mxm_settings_t *s)
+{
+	/* v2 20-byte block; live data first, then settings. See mxm_protocol.h */
+	decode_status(s);
+	s->gpu_temp = s->raw[6];
+	s->smc_temp = s->raw[7];
+	s->fan_speed = s->raw[8];
+	s->brightness = s->raw[9];
+	s->vcore_deci = s->raw[10] + 25;
+	s->fb_mb = s->raw[11] ? 64 : 32;
+	s->blank_fix = s->raw[12];
+	s->dos43 = s->raw[13];
+	s->sharpness = s->raw[14];
+	s->contrast = s->raw[15];
+	s->peaking = s->raw[16];
+	s->rgb_r = s->raw[17];
+	s->rgb_g = s->raw[18];
+	s->rgb_b = s->raw[19];
+}
+
 int mxm_read_settings(const mxm_card_t *card, mxm_settings_t *settings)
 {
 	int bit;
@@ -159,7 +204,7 @@ int mxm_read_settings(const mxm_card_t *card, mxm_settings_t *settings)
 		goto io_error;
 	Sleep(200);
 
-	for (bit = 0; bit < 40; bit++) {
+	for (bit = 0; bit < MXM_READ_BYTES * 8; bit++) {
 		BYTE data = 0;
 
 		if (gpio_write(card, MXM_GPIO_10))
@@ -177,27 +222,77 @@ int mxm_read_settings(const mxm_card_t *card, mxm_settings_t *settings)
 		if (bit > 0 && ((bit + 1) % 8) == 0)
 			byte_index++;
 	}
+	gpio_write(card, MXM_GPIO_10);
 
-	settings->brightness = settings->raw[0];
+	settings->proto_version = settings->raw[0];
+	if (settings->proto_version == MXM_PROTO_VERSION)
+		decode_v2(settings);
+	else
+		decode_legacy(card, settings);
+
 	if (settings->brightness < 10)
 		settings->brightness = 10;
 	if (settings->brightness > 100)
 		settings->brightness = 100;
 
-	settings->vcore_deci = ((settings->raw[1] >> 4) & 0x07) + 25;
-	settings->fb_mb = card->type == MXM_CARD_M4800
-		? (((settings->raw[1] >> 3) & 1) ? 64 : 32) : 16;
-	settings->blank_fix = card->type == MXM_CARD_M4800
-		? ((settings->raw[1] >> 2) & 1) : 1;
-	settings->gpu_temp = settings->raw[2];
-	settings->smc_temp = settings->raw[3];
-	settings->fan_speed = settings->raw[4];
-
-	gpio_write(card, MXM_GPIO_10);
 	return 0;
 
 io_error:
 	set_error("GPIO protocol I/O failed while reading card settings.");
+	return -1;
+}
+
+/*
+ * Short read: clock out only the leading status bytes (link/lock/resolution)
+ * and update just those fields, leaving the settings/telemetry from the last
+ * full read intact. Much faster than a full read for a status-only refresh.
+ * NOTE: this stops the transfer early, so the MSP's read state is left
+ * mid-block until its idle timeout (~2 s); the caller must not start another
+ * transaction until then (see the app's msp guard).
+ */
+int mxm_read_status(const mxm_card_t *card, mxm_settings_t *settings)
+{
+	int bit;
+	int byte_index = 0;
+
+	if (!card->present) {
+		set_error("No supported card detected.");
+		return -1;
+	}
+
+	if (gpio_write(card, MXM_GPIO_10))
+		goto io_error;
+	Sleep(50);
+	if (gpio_write(card, MXM_GPIO_11))
+		goto io_error;
+	Sleep(200);
+
+	for (bit = 0; bit < MXM_STATUS_BYTES * 8; bit++) {
+		BYTE data = 0;
+
+		if (gpio_write(card, MXM_GPIO_10))
+			goto io_error;
+		gpio_step_delay();
+		if (gpio_write(card, MXM_GPIO_11))
+			goto io_error;
+		gpio_step_delay();
+		gpio_sample_settle();
+		if (gpio_read(card, &data))
+			goto io_error;
+
+		settings->raw[byte_index] <<= 1;
+		settings->raw[byte_index] |= (data & 0x04) >> 2;
+		if (bit > 0 && ((bit + 1) % 8) == 0)
+			byte_index++;
+	}
+	gpio_write(card, MXM_GPIO_10);
+
+	if (settings->raw[0] == MXM_PROTO_VERSION)
+		decode_status(settings);
+	return 0;
+
+io_error:
+	set_error("GPIO protocol I/O failed while reading scaler status.");
 	return -1;
 }
 
@@ -227,16 +322,17 @@ static int send_byte(const mxm_card_t *card, BYTE packet)
 	return 0;
 }
 
-int mxm_write_settings(const mxm_card_t *card, const mxm_settings_t *settings)
+static int write_register(const mxm_card_t *card, BYTE index, BYTE value)
+{
+	/* v2 write transaction is [index, value]; index MSB (0) selects write */
+	return send_byte(card, index) || send_byte(card, value);
+}
+
+static int write_legacy(const mxm_card_t *card, const mxm_settings_t *settings)
 {
 	BYTE packet0;
 	BYTE packet1;
 	int vcore_code;
-
-	if (!card->present) {
-		set_error("No supported card detected.");
-		return -1;
-	}
 
 	packet0 = (BYTE)settings->brightness;
 	vcore_code = settings->vcore_deci - 25;
@@ -253,12 +349,59 @@ int mxm_write_settings(const mxm_card_t *card, const mxm_settings_t *settings)
 			packet1 |= 0x04;
 	}
 
-	if (send_byte(card, packet0) || send_byte(card, packet1)) {
-		set_error("GPIO protocol I/O failed while writing card settings.");
+	return send_byte(card, packet0) || send_byte(card, packet1);
+}
+
+/* write reg only if prev is NULL (force) or the field changed */
+#define WR_IF(field, idx, val) \
+	do { \
+		if (!prev || prev->field != settings->field) \
+			err |= write_register(card, (idx), (BYTE)(val)); \
+	} while (0)
+
+int mxm_write_settings(const mxm_card_t *card, const mxm_settings_t *settings,
+		       const mxm_settings_t *prev)
+{
+	int vcore_code;
+	int err = 0;
+
+	if (!card->present) {
+		set_error("No supported card detected.");
 		return -1;
 	}
 
+	if (!settings->scaler_capable) {
+		/* legacy firmware: single combined packet, always written */
+		if (write_legacy(card, settings))
+			goto io_error;
+		return 0;
+	}
+
+	vcore_code = settings->vcore_deci - 25;
+	if (vcore_code < 0)
+		vcore_code = 0;
+	if (vcore_code > 6)
+		vcore_code = 6;
+
+	WR_IF(brightness, MXM_REG_BACKLIGHT, settings->brightness);
+	WR_IF(vcore_deci, MXM_REG_VCORE, vcore_code);
+	WR_IF(fb_mb, MXM_REG_FBSIZE, settings->fb_mb == 64 ? 1 : 0);
+	WR_IF(blank_fix, MXM_REG_BLANK_FIX, settings->blank_fix ? 1 : 0);
+	WR_IF(dos43, MXM_REG_DOS43, settings->dos43 ? 1 : 0);
+	WR_IF(sharpness, MXM_REG_SHARPNESS, settings->sharpness);
+	WR_IF(contrast, MXM_REG_CONTRAST, settings->contrast);
+	WR_IF(peaking, MXM_REG_PEAKING, settings->peaking);
+	WR_IF(rgb_r, MXM_REG_RGB_R, settings->rgb_r);
+	WR_IF(rgb_g, MXM_REG_RGB_G, settings->rgb_g);
+	WR_IF(rgb_b, MXM_REG_RGB_B, settings->rgb_b);
+
+	if (err)
+		goto io_error;
 	return 0;
+
+io_error:
+	set_error("GPIO protocol I/O failed while writing card settings.");
+	return -1;
 }
 
 void mxm_defaults(const mxm_card_t *card, mxm_settings_t *settings)
@@ -268,4 +411,12 @@ void mxm_defaults(const mxm_card_t *card, mxm_settings_t *settings)
 	settings->vcore_deci = card->type == MXM_CARD_M4800 ? 26 : 25;
 	settings->fb_mb = card->type == MXM_CARD_M4800 ? 32 : 16;
 	settings->blank_fix = card->type == MXM_CARD_M4800 ? 0 : 1;
+	/* scaler defaults (match the RTD firmware) */
+	settings->dos43 = 1;
+	settings->sharpness = 2;
+	settings->contrast = 40;
+	settings->peaking = 0;
+	settings->rgb_r = 50;
+	settings->rgb_g = 50;
+	settings->rgb_b = 50;
 }
