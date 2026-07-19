@@ -7,10 +7,11 @@
 #include "io_backend.h"
 #include "hwc_ext.h"
 #include "mxm_protocol.h"
+#include "fir_ui.h"
 #include "mxm.h"
 #include "resource.h"
 
-#define APP_VERSION "1.1"
+#define APP_VERSION "1.2"
 #define APP_TITLE "3dfx MXM Control " APP_VERSION
 #define WM_TRAYICON (WM_USER + 100)
 #define WM_APP_REFRESH (WM_USER + 101)
@@ -26,7 +27,9 @@ enum {
 	ID_FB,
 	ID_BLANK,
 	ID_DOS43,
-	ID_SHARPNESS,
+	ID_FILTER,
+	ID_FILTER_P1,
+	ID_FILTER_P2,
 	ID_CONTRAST,
 	ID_PEAKING,
 	ID_RGB_R,
@@ -94,8 +97,6 @@ static HWND lbl_blank;
 static HWND lbl_gpu_temp;
 static HWND lbl_smc_temp;
 static HWND lbl_fan;
-static HWND lbl_raw;
-static HWND lbl_raw2;
 static HWND lbl_help;
 static HWND lbl_status;
 static HWND lbl_hwc;
@@ -108,8 +109,12 @@ static HWND btn_refresh;
 static HWND btn_apply;
 static HWND btn_defaults;
 static HWND chk_dos43;
-static HWND lbl_sharpness;
-static HWND trk_sharpness;
+static HWND lbl_filter;
+static HWND cbo_filter;
+static HWND lbl_p1;
+static HWND trk_p1;
+static HWND lbl_p2;
+static HWND trk_p2;
 static HWND lbl_contrast;
 static HWND trk_contrast;
 static HWND lbl_peaking;
@@ -192,6 +197,26 @@ static HWND make_tab_vline(int tab, int x, int y, int h)
 	return l;
 }
 
+/*
+ * Trackbar subclass: PageUp/PageDown jump to the top/bottom of the range
+ * (instead of the native page step), matching the tuning console and the DOS
+ * and BIOS setup screens. All sliders share one original class proc.
+ */
+static WNDPROC g_trk_proc;
+
+static LRESULT CALLBACK trk_subproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+	if (msg == WM_KEYDOWN && (wp == VK_PRIOR || wp == VK_NEXT)) {
+		int hi = (int)SendMessage(h, TBM_GETRANGEMAX, 0, 0);
+		int lo = (int)SendMessage(h, TBM_GETRANGEMIN, 0, 0);
+
+		SendMessage(h, TBM_SETPOS, TRUE, wp == VK_PRIOR ? hi : lo);
+		SendMessage(GetParent(h), WM_HSCROLL, 0, (LPARAM)h);
+		return 0;
+	}
+	return CallWindowProc(g_trk_proc, h, msg, wp, lp);
+}
+
 /* label + trackbar with the original shared geometry, registered on a tab */
 static HWND make_slider(int tab, int y, int id, int lo, int hi, int tick,
 			HWND *out_label)
@@ -199,14 +224,51 @@ static HWND make_slider(int tab, int y, int id, int lo, int hi, int tick,
 	HWND lbl = make_label("", 28, y + 8, 210, 18);
 	HWND trk = make_control(TRACKBAR_CLASSA, "", WS_TABSTOP | TBS_AUTOTICKS,
 				250, y, 260, 40, id);
+	WNDPROC prev;
 
 	SendMessage(trk, TBM_SETRANGE, TRUE, MAKELONG(lo, hi));
 	SendMessage(trk, TBM_SETTICFREQ, tick, 0);
+	prev = (WNDPROC)SetWindowLongPtr(trk, GWLP_WNDPROC, (LONG_PTR)trk_subproc);
+	if (!g_trk_proc)
+		g_trk_proc = prev;
 	tab_add(tab, lbl);
 	tab_add(tab, trk);
 	if (out_label)
 		*out_label = lbl;
 	return trk;
+}
+
+/*
+ * Push the active family's stored params into the filter combobox and the P1/P2
+ * sliders, reconfiguring the slider ranges for that family. P2 (the Mitchell "C"
+ * term) is disabled for families that do not use it. The per-family store lives
+ * in g_settings.filter_p1[]/filter_p2[], read back from and written to the card.
+ */
+static void configure_filter_controls(void)
+{
+	int fam = g_settings.filter_family;
+	int p1max, p2max;
+
+	if (fam < 0 || fam >= MXM_FIR_FAM_COUNT)
+		fam = MXM_FIR_FAM_MITCHELL;
+	p1max = fir_ui_p1_max(fam);
+	p2max = fir_ui_p2_max(fam);
+
+	g_settings.filter_family = fam;
+	g_settings.filter_p1[fam] = fir_ui_clamp_p1(fam, g_settings.filter_p1[fam]);
+	g_settings.filter_p2[fam] = fir_ui_clamp_p2(fam, g_settings.filter_p2[fam]);
+
+	SendMessage(cbo_filter, CB_SETCURSEL, fam, 0);
+
+	SendMessage(trk_p1, TBM_SETRANGE, TRUE, MAKELONG(0, p1max ? p1max : 1));
+	SendMessage(trk_p1, TBM_SETTICFREQ, 4, 0);
+	SendMessage(trk_p1, TBM_SETPOS, TRUE, g_settings.filter_p1[fam]);
+	EnableWindow(trk_p1, p1max > 0 && g_settings.scaler_capable);
+
+	SendMessage(trk_p2, TBM_SETRANGE, TRUE, MAKELONG(0, p2max ? p2max : 1));
+	SendMessage(trk_p2, TBM_SETTICFREQ, 4, 0);
+	SendMessage(trk_p2, TBM_SETPOS, TRUE, g_settings.filter_p2[fam]);
+	EnableWindow(trk_p2, p2max > 0 && g_settings.scaler_capable);
 }
 
 static void set_text(HWND hwnd, const char *fmt, ...)
@@ -256,10 +318,13 @@ static void show_help_contents(void)
 		"modes and graphics modes (e.g. 640x400, 640x350, 720x350, 720x400) - "
 		"so they display in their intended 4:3 shape instead of stretched to "
 		"fill the panel. Stored on the card.\r\n"
-		"Peaking is the effective sharpness control (edge enhancement). "
-		"Sharpness (0-4) is the upscaler filter and is subtle.\r\n"
+		"Scaling Filter chooses the kernel used to upscale to the panel and its "
+		"shape parameters (default Mitchell B=0.40 C=0.55). Lower/negative values "
+		"sharpen with more ringing; higher values soften.\r\n"
+		"Edge Enhance (0-30, 0 = off) adds extra bite on top of the filter.\r\n"
 		"Contrast and White Balance R/G/B apply live; White Balance 50 is "
-		"neutral. Lower a channel to warm or cool the image.\r\n\r\n"
+		"neutral. Lower a channel to warm or cool the image.\r\n"
+		"On any slider, PgUp/PgDn jumps to the ends of the range.\r\n\r\n"
 		"Defaults loads safe values into the utility. Click Apply to store them "
 		"on the card.\r\n\r\n"
 		"If video output is lost after a bad Core Voltage setting (the one "
@@ -342,7 +407,9 @@ static void enable_card_controls(int enabled)
 	EnableWindow(chk_blank, enabled && g_card.type == MXM_CARD_M4800);
 
 	EnableWindow(chk_dos43, scaler);
-	EnableWindow(trk_sharpness, scaler);
+	EnableWindow(cbo_filter, scaler);
+	EnableWindow(trk_p1, scaler);
+	EnableWindow(trk_p2, scaler && fir_ui_p2_max(g_settings.filter_family) > 0);
 	EnableWindow(trk_contrast, scaler);
 	EnableWindow(trk_peaking, scaler);
 	EnableWindow(trk_rgb_r, scaler);
@@ -350,23 +417,8 @@ static void enable_card_controls(int enabled)
 	EnableWindow(trk_rgb_b, scaler);
 }
 
-static void raw_line(char *buf, int len, int start, int count)
-{
-	int i;
-	int pos = 0;
-
-	buf[0] = '\0';
-	for (i = start; i < start + count && pos < len - 4; i++)
-		pos += wsprintfA(buf + pos, (i > start) ? " %02X" : "%02X",
-				 g_settings.raw[i]);
-}
-
 static void update_value_labels(void)
 {
-	int n = g_settings.scaler_capable ? MXM_READ_BYTES : 5;
-	char l1[48];
-	char l2[48];
-
 	set_text(lbl_brightness, "Panel Backlight: %d%%", g_settings.brightness);
 	set_text(lbl_vcore, "Core Voltage: %d.%d V",
 		 g_settings.vcore_deci / 10, g_settings.vcore_deci % 10);
@@ -380,19 +432,29 @@ static void update_value_labels(void)
 	set_text(lbl_gpu_temp, "GPU Temperature: %d C", g_settings.gpu_temp);
 	set_text(lbl_smc_temp, "SMC Temperature: %d C", g_settings.smc_temp);
 	set_text(lbl_fan, "Fan Speed: %d%%", g_settings.fan_speed);
-	if (n > 10) {
-		raw_line(l1, sizeof(l1), 0, 10);
-		raw_line(l2, sizeof(l2), 10, n - 10);
-	} else {
-		raw_line(l1, sizeof(l1), 0, n);
-		l2[0] = '\0';
-	}
-	set_text(lbl_raw, "Raw Packet: %s", l1);
-	SetWindowTextA(lbl_raw2, l2);
 
-	set_text(lbl_sharpness, "Sharpness: %d", g_settings.sharpness);
+	{
+		int fam = g_settings.filter_family;
+		char v1[8];
+		char v2[8];
+
+		if (fam < 0 || fam >= MXM_FIR_FAM_COUNT)
+			fam = MXM_FIR_FAM_MITCHELL;
+		if (fir_ui_p1_max(fam) > 0) {
+			fir_ui_fmt_x100(fir_ui_p1_val_x100(fam, g_settings.filter_p1[fam]), v1);
+			set_text(lbl_p1, "Filter %s: %s", fir_ui_p1_label(fam), v1);
+		} else {
+			SetWindowTextA(lbl_p1, "Filter: fixed kernel (no parameters)");
+		}
+		if (fir_ui_p2_max(fam) > 0) {
+			fir_ui_fmt_x100(fir_ui_p2_val_x100(fam, g_settings.filter_p2[fam]), v2);
+			set_text(lbl_p2, "Filter %s: %s", fir_ui_p2_label(fam), v2);
+		} else {
+			SetWindowTextA(lbl_p2, "");
+		}
+	}
 	set_text(lbl_contrast, "Contrast: %d", g_settings.contrast);
-	set_text(lbl_peaking, "Peaking (edge enhance): %d", g_settings.peaking);
+	set_text(lbl_peaking, "Edge Enhance: %d", g_settings.peaking);
 	set_text(lbl_rgb_r, "White balance R: %d", g_settings.rgb_r);
 	set_text(lbl_rgb_g, "White balance G: %d", g_settings.rgb_g);
 	set_text(lbl_rgb_b, "White balance B: %d", g_settings.rgb_b);
@@ -441,14 +503,18 @@ static void show_setting_help(int id)
 	case ID_DOS43:
 		set_help_text("Force 4:3 pillarboxes DOS-era video modes - both text modes and graphics modes (e.g. 640x400, 640x350, 720x350, 720x400) - so they display in their intended 4:3 shape instead of stretched to fill the panel. Stored on the card.");
 		break;
-	case ID_SHARPNESS:
-		set_help_text("Scaler upscale filter (0-4). Effect is subtle; use Peaking for visible sharpening. Applies live.");
+	case ID_FILTER:
+		set_help_text("Scaling filter family used to upscale to the panel. Mitchell is a good all-round default; Keys is a sharper cubic; Gaussian is soft; Lanczos-2 is sharpest but rings the most (no parameters). Applies live. PgUp/PgDn on any slider jumps to the ends.");
+		break;
+	case ID_FILTER_P1:
+	case ID_FILTER_P2:
+		set_help_text("Filter shape parameter. Lower/negative = sharper with more ringing; higher = softer. Mitchell B=0.40 C=0.55 is the default. Applies live.");
 		break;
 	case ID_CONTRAST:
 		set_help_text("Scaler contrast (0-100). Applies live to the displayed image.");
 		break;
 	case ID_PEAKING:
-		set_help_text("Edge enhancement / sharpening (0-100, 0 = off). The effective sharpness control.");
+		set_help_text("Edge enhancement (0-30, 0 = off). Adds extra bite on top of the scaling filter. Values above ~15 start to look harsh. Applies live.");
 		break;
 	case ID_RGB_R:
 	case ID_RGB_G:
@@ -484,7 +550,7 @@ static void settings_to_controls(void)
 
 	SendMessage(chk_dos43, BM_SETCHECK,
 		    g_settings.dos43 ? BST_CHECKED : BST_UNCHECKED, 0);
-	SendMessage(trk_sharpness, TBM_SETPOS, TRUE, g_settings.sharpness);
+	configure_filter_controls();
 	SendMessage(trk_contrast, TBM_SETPOS, TRUE, g_settings.contrast);
 	SendMessage(trk_peaking, TBM_SETPOS, TRUE, g_settings.peaking);
 	SendMessage(trk_rgb_r, TBM_SETPOS, TRUE, g_settings.rgb_r);
@@ -509,9 +575,17 @@ static void controls_to_settings(void)
 		? SendMessage(chk_blank, BM_GETCHECK, 0, 0) == BST_CHECKED : 1;
 
 	if (g_settings.scaler_capable) {
+		int fam = (int)SendMessage(cbo_filter, CB_GETCURSEL, 0, 0);
+
 		g_settings.dos43 =
 			SendMessage(chk_dos43, BM_GETCHECK, 0, 0) == BST_CHECKED;
-		g_settings.sharpness = (int)SendMessage(trk_sharpness, TBM_GETPOS, 0, 0);
+		if (fam < 0 || fam >= MXM_FIR_FAM_COUNT)
+			fam = MXM_FIR_FAM_MITCHELL;
+		g_settings.filter_family = fam;
+		g_settings.filter_p1[fam] = fir_ui_clamp_p1(fam,
+			(int)SendMessage(trk_p1, TBM_GETPOS, 0, 0));
+		g_settings.filter_p2[fam] = fir_ui_clamp_p2(fam,
+			(int)SendMessage(trk_p2, TBM_GETPOS, 0, 0));
 		g_settings.contrast = (int)SendMessage(trk_contrast, TBM_GETPOS, 0, 0);
 		g_settings.peaking = (int)SendMessage(trk_peaking, TBM_GETPOS, 0, 0);
 		g_settings.rgb_r = (int)SendMessage(trk_rgb_r, TBM_GETPOS, 0, 0);
@@ -669,6 +743,7 @@ static void create_ui(void)
 {
 	HWND logo;
 	TCITEMA tie;
+	int i;
 
 	g_font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
 
@@ -676,7 +751,7 @@ static void create_ui(void)
 	SendMessage(logo, STM_SETICON, (WPARAM)g_icon, 0);
 	make_label("Unified M3800/M4800 control panel", 58, 20, 320, 18);
 
-	g_tab = make_control(WC_TABCONTROLA, "", WS_TABSTOP, 8, 50, 600, 486, 0);
+	g_tab = make_control(WC_TABCONTROLA, "", WS_TABSTOP, 8, 50, 600, 576, 0);
 	memset(&tie, 0, sizeof(tie));
 	tie.mask = TCIF_TEXT;
 	tie.pszText = (LPSTR)"Card Info && Settings";
@@ -685,75 +760,83 @@ static void create_ui(void)
 	SendMessage(g_tab, TCM_INSERTITEMA, 1, (LPARAM)&tie);
 
 	/* ---- Tab 0: Card Info & Settings (original appearance, no backlight) ---- */
-	make_tab_group(0, "Card Information", 16, 78, 580, 120);
+	make_tab_group(0, "Card Information", 16, 78, 580, 96);
 	lbl_card     = make_tab_label(0, "Card Model:", 28, 102, 255, 18);
 	lbl_gpu      = make_tab_label(0, "GPU Model:", 28, 126, 255, 18);
 	lbl_revision = make_tab_label(0, "Card Revision:", 28, 150, 255, 18);
-	make_tab_vline(0, 300, 100, 86);
+	make_tab_vline(0, 300, 100, 62);
 	lbl_display  = make_tab_label(0, "Display Type:", 318, 102, 270, 18);
 	lbl_bridge   = make_tab_label(0, "Bridge:", 318, 126, 270, 18);
-	lbl_raw      = make_tab_label(0, "Raw Packet:", 318, 150, 270, 18);
-	lbl_raw2     = make_tab_label(0, "", 318, 168, 270, 18);
 
-	make_tab_group(0, "Live Status", 16, 206, 580, 58);
-	lbl_gpu_temp = make_tab_label(0, "GPU Temperature:", 28, 228, 190, 18);
-	lbl_smc_temp = make_tab_label(0, "SMC Temperature:", 228, 228, 180, 18);
-	lbl_fan      = make_tab_label(0, "Fan Speed:", 418, 228, 150, 18);
+	make_tab_group(0, "Live Status", 16, 182, 580, 58);
+	lbl_gpu_temp = make_tab_label(0, "GPU Temperature:", 28, 204, 190, 18);
+	lbl_smc_temp = make_tab_label(0, "SMC Temperature:", 228, 204, 180, 18);
+	lbl_fan      = make_tab_label(0, "Fan Speed:", 418, 204, 150, 18);
 
-	make_tab_group(0, "Driver Interface", 16, 272, 580, 58);
-	lbl_hwc = make_tab_label(0, "3dfx driver interface:", 28, 294, 548, 18);
+	make_tab_group(0, "Driver Interface", 16, 248, 580, 58);
+	lbl_hwc = make_tab_label(0, "3dfx driver interface:", 28, 270, 548, 18);
 
-	make_tab_group(0, "Card Settings", 16, 338, 580, 186);
-	trk_vcore = make_slider(0, 358, ID_VCORE, 25, 31, 1, &lbl_vcore);
-	trk_clock = make_slider(0, 398, ID_CLOCK, MXM_CLOCK_MIN_MHZ,
+	make_tab_group(0, "Card Settings", 16, 314, 580, 186);
+	trk_vcore = make_slider(0, 334, ID_VCORE, 25, 31, 1, &lbl_vcore);
+	trk_clock = make_slider(0, 374, ID_CLOCK, MXM_CLOCK_MIN_MHZ,
 				MXM_CLOCK_MAX_MHZ, 10, &lbl_clock);
-	make_tab_hline(0, 24, 444, 552);
-	lbl_fb = make_tab_label(0, "Framebuffer Memory:", 28, 464, 210, 18);
+	make_tab_hline(0, 24, 420, 552);
+	lbl_fb = make_tab_label(0, "Framebuffer Memory:", 28, 440, 210, 18);
 	cbo_fb = make_control("COMBOBOX", "", WS_TABSTOP | CBS_DROPDOWNLIST,
-			      262, 460, 120, 100, ID_FB);
+			      262, 436, 120, 100, ID_FB);
 	tab_add(0, cbo_fb);
-	lbl_blank = make_tab_label(0, "VSA NT Blank Fix:", 28, 498, 210, 18);
+	lbl_blank = make_tab_label(0, "VSA NT Blank Fix:", 28, 474, 210, 18);
 	chk_blank = make_control("BUTTON", "Enable", WS_TABSTOP | BS_AUTOCHECKBOX,
-				 262, 494, 90, 22, ID_BLANK);
+				 262, 470, 90, 22, ID_BLANK);
 	tab_add(0, chk_blank);
 
 	/* ---- Tab 1: Image & Panel (backlight + scaler) ---- */
 	make_tab_group(1, "Panel", 16, 78, 580, 60);
 	trk_brightness = make_slider(1, 94, ID_BRIGHTNESS, 10, 100, 10, &lbl_brightness);
 
-	make_tab_group(1, "Image / Scaler Settings", 16, 146, 580, 320);
+	make_tab_group(1, "Image / Scaler Settings", 16, 146, 580, 414);
 	chk_dos43 = make_control("BUTTON", "Force 4:3 for DOS modes",
 				 WS_TABSTOP | BS_AUTOCHECKBOX, 28, 168, 420, 22,
 				 ID_DOS43);
 	tab_add(1, chk_dos43);
 	make_tab_hline(1, 24, 198, 552);
-	trk_sharpness = make_slider(1, 208, ID_SHARPNESS, 0, 4, 1, &lbl_sharpness);
-	trk_contrast  = make_slider(1, 248, ID_CONTRAST, 0, 100, 10, &lbl_contrast);
-	trk_peaking   = make_slider(1, 288, ID_PEAKING, 0, 100, 10, &lbl_peaking);
-	make_tab_hline(1, 24, 334, 552);
-	trk_rgb_r = make_slider(1, 344, ID_RGB_R, 0, 100, 10, &lbl_rgb_r);
-	trk_rgb_g = make_slider(1, 384, ID_RGB_G, 0, 100, 10, &lbl_rgb_g);
-	trk_rgb_b = make_slider(1, 424, ID_RGB_B, 0, 100, 10, &lbl_rgb_b);
 
-	make_tab_group(1, "Scaler Status", 16, 474, 580, 50);
-	lbl_scaler_status = make_tab_label(1, "Scaler:", 28, 494, 340, 18);
-	lbl_scaler_res    = make_tab_label(1, "", 372, 494, 210, 18);
+	lbl_filter = make_tab_label(1, "Scaling Filter:", 28, 214, 210, 18);
+	cbo_filter = make_control("COMBOBOX", "", WS_TABSTOP | CBS_DROPDOWNLIST,
+				  250, 210, 200, 200, ID_FILTER);
+	tab_add(1, cbo_filter);
+	for (i = 0; i < MXM_FIR_FAM_COUNT; i++)
+		SendMessage(cbo_filter, CB_ADDSTRING, 0, (LPARAM)fir_family_name[i]);
+
+	trk_p1 = make_slider(1, 240, ID_FILTER_P1, 0, 20, 4, &lbl_p1);
+	trk_p2 = make_slider(1, 280, ID_FILTER_P2, 0, 20, 4, &lbl_p2);
+	make_tab_hline(1, 24, 326, 552);
+	trk_contrast  = make_slider(1, 336, ID_CONTRAST, 0, 100, 10, &lbl_contrast);
+	trk_peaking   = make_slider(1, 376, ID_PEAKING, 0, 30, 5, &lbl_peaking);
+	make_tab_hline(1, 24, 422, 552);
+	trk_rgb_r = make_slider(1, 432, ID_RGB_R, 0, 100, 10, &lbl_rgb_r);
+	trk_rgb_g = make_slider(1, 472, ID_RGB_G, 0, 100, 10, &lbl_rgb_g);
+	trk_rgb_b = make_slider(1, 512, ID_RGB_B, 0, 100, 10, &lbl_rgb_b);
+
+	make_tab_group(1, "Scaler Status", 16, 568, 580, 50);
+	lbl_scaler_status = make_tab_label(1, "Scaler:", 28, 588, 340, 18);
+	lbl_scaler_res    = make_tab_label(1, "", 372, 588, 210, 18);
 
 	/* ---- shared bottom ---- */
-	make_group("Setting Notes", 12, 544, 600, 74);
-	lbl_help = make_label("", 28, 564, 572, 46);
+	make_group("Setting Notes", 12, 634, 600, 74);
+	lbl_help = make_label("", 28, 654, 572, 46);
 
 	btn_refresh = make_control("BUTTON", "Refresh", WS_TABSTOP | BS_PUSHBUTTON,
-				   20, 626, 88, 28, ID_REFRESH);
+				   20, 716, 88, 28, ID_REFRESH);
 	btn_apply = make_control("BUTTON", "Apply", WS_TABSTOP | BS_PUSHBUTTON,
-				 118, 626, 88, 28, ID_APPLY);
+				 118, 716, 88, 28, ID_APPLY);
 	btn_defaults = make_control("BUTTON", "Defaults", WS_TABSTOP | BS_PUSHBUTTON,
-				    216, 626, 88, 28, ID_DEFAULTS);
+				    216, 716, 88, 28, ID_DEFAULTS);
 	make_control("BUTTON", "Exit", WS_TABSTOP | BS_PUSHBUTTON,
-		     314, 626, 88, 28, ID_EXIT);
+		     314, 716, 88, 28, ID_EXIT);
 
-	lbl_backend = make_label("Backend:", 12, 664, 230, 18);
-	lbl_status = make_label("Starting...", 252, 664, 350, 18);
+	lbl_backend = make_label("Backend:", 12, 754, 230, 18);
+	lbl_status = make_label("Starting...", 252, 754, 350, 18);
 	update_default_help();
 	enable_card_controls(0);
 	tab_select(0);
@@ -794,7 +877,8 @@ static int trk_setting_id(HWND h)
 	if (h == trk_brightness) return ID_BRIGHTNESS;
 	if (h == trk_vcore)      return ID_VCORE;
 	if (h == trk_clock)      return ID_CLOCK;
-	if (h == trk_sharpness)  return ID_SHARPNESS;
+	if (h == trk_p1)         return ID_FILTER_P1;
+	if (h == trk_p2)         return ID_FILTER_P2;
 	if (h == trk_contrast)   return ID_CONTRAST;
 	if (h == trk_peaking)    return ID_PEAKING;
 	if (h == trk_rgb_r)      return ID_RGB_R;
@@ -890,6 +974,31 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 			show_setting_help(ID_DOS43);
 			controls_to_settings();
 			return 0;
+		case ID_FILTER:
+			if (HIWORD(wp) == CBN_SELCHANGE || HIWORD(wp) == CBN_SETFOCUS) {
+				show_setting_help(ID_FILTER);
+				if (HIWORD(wp) == CBN_SELCHANGE) {
+					int oldfam = g_settings.filter_family;
+					int newfam = (int)SendMessage(cbo_filter,
+								      CB_GETCURSEL, 0, 0);
+
+					/* capture the family we are leaving into its
+					 * per-family slot before switching */
+					if (oldfam >= 0 && oldfam < MXM_FIR_FAM_COUNT) {
+						g_settings.filter_p1[oldfam] =
+							(int)SendMessage(trk_p1, TBM_GETPOS, 0, 0);
+						g_settings.filter_p2[oldfam] =
+							(int)SendMessage(trk_p2, TBM_GETPOS, 0, 0);
+					}
+					if (newfam < 0 || newfam >= MXM_FIR_FAM_COUNT)
+						newfam = MXM_FIR_FAM_MITCHELL;
+					g_settings.filter_family = newfam;
+					configure_filter_controls();
+					update_value_labels();
+					enable_card_controls(g_card.present);
+				}
+			}
+			return 0;
 		}
 		break;
 	case WM_SIZE:
@@ -959,7 +1068,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
 		rc.left = 0;
 		rc.top = 0;
 		rc.right = 620;   /* client width  */
-		rc.bottom = 690;  /* client height */
+		rc.bottom = 786;  /* client height */
 		AdjustWindowRect(&rc, style, TRUE);   /* TRUE: window has a menu */
 
 		g_hwnd = CreateWindowExA(0, wc.lpszClassName, APP_TITLE, style,

@@ -184,6 +184,14 @@ static void decode_v2(mxm_settings_t *s)
 	s->rgb_r = s->raw[17];
 	s->rgb_g = s->raw[18];
 	s->rgb_b = s->raw[19];
+	s->filter_family = s->raw[20];
+	{
+		int f;
+		for (f = 0; f < MXM_FIR_FAM_COUNT; f++) {
+			s->filter_p1[f] = s->raw[21 + f];
+			s->filter_p2[f] = s->raw[21 + MXM_FIR_FAM_COUNT + f];
+		}
+	}
 }
 
 int mxm_read_settings(const mxm_card_t *card, mxm_settings_t *settings)
@@ -388,12 +396,42 @@ int mxm_write_settings(const mxm_card_t *card, const mxm_settings_t *settings,
 	WR_IF(fb_mb, MXM_REG_FBSIZE, settings->fb_mb == 64 ? 1 : 0);
 	WR_IF(blank_fix, MXM_REG_BLANK_FIX, settings->blank_fix ? 1 : 0);
 	WR_IF(dos43, MXM_REG_DOS43, settings->dos43 ? 1 : 0);
-	WR_IF(sharpness, MXM_REG_SHARPNESS, settings->sharpness);
+	/* legacy REG_SHARPNESS is intentionally NOT written: on the RTD it would
+	 * clobber the generated scale-up FIR. The filter family/p1/p2 own it now. */
 	WR_IF(contrast, MXM_REG_CONTRAST, settings->contrast);
 	WR_IF(peaking, MXM_REG_PEAKING, settings->peaking);
 	WR_IF(rgb_r, MXM_REG_RGB_R, settings->rgb_r);
 	WR_IF(rgb_g, MXM_REG_RGB_G, settings->rgb_g);
 	WR_IF(rgb_b, MXM_REG_RGB_B, settings->rgb_b);
+
+	/*
+	 * Filter params are per-family on the SMC. A P1/P2 write lands on whatever
+	 * family is active there, so push each changed family by making it active
+	 * first, then leave the SMC on the family the user actually has selected.
+	 */
+	{
+		int fam;
+		int touched = 0;
+
+		for (fam = 0; fam < MXM_FIR_FAM_COUNT; fam++) {
+			int dp1 = !prev || prev->filter_p1[fam] != settings->filter_p1[fam];
+			int dp2 = !prev || prev->filter_p2[fam] != settings->filter_p2[fam];
+
+			if (!dp1 && !dp2)
+				continue;
+			err |= write_register(card, MXM_REG_FILTER_FAMILY, (BYTE)fam);
+			if (dp1)
+				err |= write_register(card, MXM_REG_FILTER_P1,
+						      (BYTE)settings->filter_p1[fam]);
+			if (dp2)
+				err |= write_register(card, MXM_REG_FILTER_P2,
+						      (BYTE)settings->filter_p2[fam]);
+			touched = 1;
+		}
+		if (touched || !prev || prev->filter_family != settings->filter_family)
+			err |= write_register(card, MXM_REG_FILTER_FAMILY,
+					      (BYTE)settings->filter_family);
+	}
 
 	if (err)
 		goto io_error;
@@ -411,7 +449,7 @@ void mxm_defaults(const mxm_card_t *card, mxm_settings_t *settings)
 	settings->vcore_deci = card->type == MXM_CARD_M4800 ? 26 : 25;
 	settings->fb_mb = card->type == MXM_CARD_M4800 ? 32 : 16;
 	settings->blank_fix = card->type == MXM_CARD_M4800 ? 0 : 1;
-	/* scaler defaults (match the RTD firmware) */
+	/* scaler defaults (match the RTD/SMC firmware) */
 	settings->dos43 = 1;
 	settings->sharpness = 2;
 	settings->contrast = 40;
@@ -419,4 +457,16 @@ void mxm_defaults(const mxm_card_t *card, mxm_settings_t *settings)
 	settings->rgb_r = 50;
 	settings->rgb_g = 50;
 	settings->rgb_b = 50;
+	/* per-family filter defaults: Mitchell 0.40/0.55, Keys -0.45, Gauss 0.50 */
+	settings->filter_family = MXM_FIR_FAM_MITCHELL;
+	{
+		static const int def_p1[MXM_FIR_FAM_COUNT] = { 8, 11, 4, 0 };
+		static const int def_p2[MXM_FIR_FAM_COUNT] = { 11, 0, 0, 0 };
+		int f;
+
+		for (f = 0; f < MXM_FIR_FAM_COUNT; f++) {
+			settings->filter_p1[f] = def_p1[f];
+			settings->filter_p2[f] = def_p2[f];
+		}
+	}
 }

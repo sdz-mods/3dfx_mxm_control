@@ -32,12 +32,17 @@ typedef struct {
 	int fan_speed;
 	/* scaler image settings (v2 only) */
 	int dos43;
-	int sharpness;
+	int sharpness;      /* legacy table select (read-only; superseded by filter) */
 	int contrast;
 	int peaking;
 	int rgb_r;
 	int rgb_g;
 	int rgb_b;
+	/* scale-up FIR filter (v2 firmware): active family + per-family params.
+	 * The active tuning is filter_p1[filter_family] / filter_p2[filter_family]. */
+	int filter_family;  /* MXM_FIR_FAM_* */
+	int filter_p1[MXM_FIR_FAM_COUNT];
+	int filter_p2[MXM_FIR_FAM_COUNT];
 	/* scaler live status (v2 only) */
 	int scaler_link;
 	int scaler_lock;
